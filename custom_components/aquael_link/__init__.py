@@ -11,13 +11,22 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import entity_registry as er
 
-from .const import CONF_ADD_TO_PANEL, CONF_DEVICE_TYPE, DOMAIN, TYPE_HYPERMAX, TYPE_THERMOMETER
+from .const import (
+    CONF_ADD_TO_PANEL,
+    CONF_DEVICE_TYPE,
+    DOMAIN,
+    TYPE_HYPERMAX,
+    TYPE_LIGHT,
+    TYPE_SOCKET,
+    TYPE_THERMOMETER,
+)
 from .coordinator import AquaelLinkCoordinator, discover_devices
 
 _LOGGER = logging.getLogger(__name__)
 
 PANEL_URL_PATH = "aquael-link"
 PANEL_STATIC_URL = f"/{DOMAIN}_panel"
+PANEL_DEVICE_TYPES = (TYPE_HYPERMAX, TYPE_THERMOMETER, TYPE_LIGHT, TYPE_SOCKET)
 
 
 PLATFORMS = [
@@ -52,7 +61,7 @@ async def async_setup_entry(hass: HomeAssistant, entry):
 
     coordinator = AquaelLinkCoordinator(hass, entry, data["lock"])
     data["coordinators"][entry.entry_id] = coordinator
-    if entry.data.get(CONF_ADD_TO_PANEL) and entry.data.get(CONF_DEVICE_TYPE) in (TYPE_THERMOMETER, TYPE_HYPERMAX):
+    if entry.data.get(CONF_ADD_TO_PANEL) and entry.data.get(CONF_DEVICE_TYPE) in PANEL_DEVICE_TYPES:
         await _async_register_panel(hass, data)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await coordinator.async_refresh()
@@ -81,21 +90,23 @@ def _async_register_thermometer_proxy(hass: HomeAssistant, data: dict):
     if data["proxy_registered"]:
         return
     hass.http.register_view(AquaelThermometerProxyView)
+    hass.http.register_view(AquaelHypermaxProxyView)
     data["proxy_registered"] = True
 
 
-class AquaelThermometerProxyView(HomeAssistantView):
-    url = "/api/aquael_link/thermometer/{entry_id}/{resource}"
-    name = "api:aquael_link:thermometer"
+class _AquaelDeviceProxyView(HomeAssistantView):
     requires_auth = True
+    device_type = None
+    allowed_resources = frozenset()
+    log_label = "device"
 
     async def get(self, request, entry_id, resource):
-        if resource not in {"readDATA", "readADC", "all.csv", "notifi.csv"}:
+        if resource not in self.allowed_resources:
             raise web.HTTPNotFound()
 
         hass = request.app["hass"]
         coordinator = hass.data.get(DOMAIN, {}).get("coordinators", {}).get(entry_id)
-        if coordinator is None or coordinator.device_type != TYPE_THERMOMETER:
+        if coordinator is None or coordinator.device_type != self.device_type:
             raise web.HTTPNotFound()
 
         try:
@@ -112,8 +123,24 @@ class AquaelThermometerProxyView(HomeAssistantView):
                     headers={"Content-Type": content_type},
                 )
         except (ClientError, TimeoutError) as err:
-            _LOGGER.warning("Thermometer proxy request failed for %s: %s", resource, err)
-            raise web.HTTPBadGateway(text="Aquael thermometer is unavailable") from err
+            _LOGGER.warning("%s proxy request failed for %s: %s", self.log_label, resource, err)
+            raise web.HTTPBadGateway(text=f"Aquael {self.log_label} is unavailable") from err
+
+
+class AquaelThermometerProxyView(_AquaelDeviceProxyView):
+    url = "/api/aquael_link/thermometer/{entry_id}/{resource}"
+    name = "api:aquael_link:thermometer"
+    device_type = TYPE_THERMOMETER
+    allowed_resources = {"readDATA", "readADC", "all.csv", "notifi.csv"}
+    log_label = "thermometer"
+
+
+class AquaelHypermaxProxyView(_AquaelDeviceProxyView):
+    url = "/api/aquael_link/hypermax/{entry_id}/{resource}"
+    name = "api:aquael_link:hypermax"
+    device_type = TYPE_HYPERMAX
+    allowed_resources = {"readDATA", "all.csv", "notifi.csv"}
+    log_label = "hypermax"
 
 
 async def _async_register_panel(hass: HomeAssistant, data: dict):
@@ -131,7 +158,7 @@ async def _async_register_panel(hass: HomeAssistant, data: dict):
             frontend_url_path=PANEL_URL_PATH,
             sidebar_title="Aquael Link",
             sidebar_icon="mdi:fishbowl-outline",
-            module_url=f"{PANEL_STATIC_URL}/aquael-link-panel.js?v=20260612-thermometer-auth-019-v1",
+            module_url=f"{PANEL_STATIC_URL}/aquael-link-panel.js?v=20260629-hypermax-chart-auth-031-v1",
             embed_iframe=False,
             require_admin=False,
         )
@@ -167,7 +194,7 @@ async def websocket_get_panel_devices(hass, connection, msg):
         if not entry.data.get(CONF_ADD_TO_PANEL):
             continue
         device_type = entry.data.get(CONF_DEVICE_TYPE)
-        if device_type not in (TYPE_THERMOMETER, TYPE_HYPERMAX):
+        if device_type not in PANEL_DEVICE_TYPES:
             continue
         coordinator = coordinators.get(entry.entry_id)
         ip = coordinator.ip if coordinator else entry.data.get(CONF_IP_ADDRESS)
@@ -178,6 +205,7 @@ async def websocket_get_panel_devices(hass, connection, msg):
             "original_identifier": original_identifier,
             "type": device_type,
             "ip": ip,
+            "entities": _panel_entities_for_entry(registry, entry.entry_id),
         }
         if device_type == TYPE_THERMOMETER:
             device["chart_url"] = (
@@ -185,15 +213,17 @@ async def websocket_get_panel_devices(hass, connection, msg):
                 f"?v=20260612-thermometer-auth-019-v1&entry_id={entry.entry_id}"
             )
         elif device_type == TYPE_HYPERMAX:
-            device["chart_url"] = f"{PANEL_STATIC_URL}/aquael_hypermax/chart.html?ip={ip}&v=20260610-chart-nullguard-v1"
-            device["entities"] = _panel_entities_for_entry(registry, entry.entry_id)
+            device["chart_url"] = (
+                f"{PANEL_STATIC_URL}/aquael_hypermax/chart.html"
+                f"?v=20260629-hypermax-chart-auth-v2&entry_id={entry.entry_id}"
+            )
             if coordinator and coordinator.data:
                 device["pin_state"] = coordinator.data.get("display_pin_state")
                 device["pin_code"] = coordinator.data.get("display_pin_code")
         devices.append(device)
     devices.sort(
         key=lambda device: (
-            {TYPE_HYPERMAX: 0, TYPE_THERMOMETER: 1}.get(device["type"], 99),
+            {TYPE_HYPERMAX: 0, TYPE_THERMOMETER: 1, TYPE_LIGHT: 2, TYPE_SOCKET: 3}.get(device["type"], 99),
             device.get("original_identifier") or device.get("name") or "",
         )
     )
@@ -243,6 +273,13 @@ def _panel_entities_for_entry(registry, entry_id):
             "pump": "_pump_enabled",
             "thermostat_switch": "_thermostat_enabled",
             "notify": "_heater_notify",
+            "auto_mode": "_alarms_enabled",
+            "output_1": "_output_1",
+            "output_2": "_output_2",
+        },
+        "select": {
+            "output_1_mode": "_output_1_mode_select",
+            "output_2_mode": "_output_2_mode_select",
         },
         "text": {
             "name": "_device_name_text",
@@ -253,11 +290,22 @@ def _panel_entities_for_entry(registry, entry_id):
             "temp_offset": "_heater_temperature_offset_number",
             "notify_min": "_heater_notify_min_number",
             "notify_max": "_heater_notify_max_number",
+            "light_red": "_red_number",
+            "light_blue": "_blue_number",
+            "light_white": "_white_number",
         },
         "button": {
             "identify": "_identify",  # unique_id: {entry_id}_identify
+            "preset_plant": "_preset_plant",
+            "preset_sunny": "_preset_sunny",
+            "preset_marine": "_preset_marine",
+        },
+        "light": {
+            "light": "_light",
         },
         "sensor": {
+            "water_temperature": "_water",
+            "ambient_temperature": "_ambient",
             "current_temperature": "_filter_current_temperature",
             "target_temperature": "_filter_static_temperature",
             "filter_efficiency": "_filter_static_efficiency",
@@ -265,6 +313,8 @@ def _panel_entities_for_entry(registry, entry_id):
             "top_heater_power": "_top_heater_power",
             "bottom_heater_power": "_bottom_heater_power",
             "heater_mode": "_heater_mode",
+            "output_1_state": "_output_1_state",
+            "output_2_state": "_output_2_state",
             "rssi": "_rssi",
             "ip_address": "_ip_address",
             "mac": "_mac",

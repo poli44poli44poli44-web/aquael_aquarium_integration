@@ -1,5 +1,5 @@
 const PANEL_STATIC_URL = "/aquael_link_panel";
-const PANEL_VERSION = "0.19";
+const PANEL_VERSION = "0.31";
 
 class AquaelLinkPanel extends HTMLElement {
   constructor() {
@@ -12,6 +12,7 @@ class AquaelLinkPanel extends HTMLElement {
     this._pending = {};
     this._pendingTimers = {};
     this._optimisticSwitch = null;
+    this._tankPhoto = this._loadTankPhoto();
   }
 
   set hass(hass) {
@@ -23,12 +24,12 @@ class AquaelLinkPanel extends HTMLElement {
     if (this._dragging || this._iframeMode) {
       return;
     }
-    // Don't wipe an input the user is typing into.
+
     const active = this.shadowRoot && this.shadowRoot.activeElement;
     if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA")) {
       return;
     }
-    // Re-render only when one of the selected device's entities changed.
+
     const sig = this._stateSignature();
     if (sig !== this._lastSig) {
       this._render();
@@ -36,19 +37,22 @@ class AquaelLinkPanel extends HTMLElement {
   }
 
   _stateSignature() {
-    const device = this._selected;
-    if (!device || !this._hass) {
+    if (!this._hass) {
       return "";
     }
     const parts = [];
-    for (const id of Object.values(device.entities || {})) {
-      const st = this._hass.states[id];
-      parts.push(
-        id + "=" + (st
-          ? st.state + "|" + (st.attributes.temperature != null ? st.attributes.temperature : "") +
-            "|" + (st.attributes.current_temperature != null ? st.attributes.current_temperature : "")
-          : "")
-      );
+    for (const device of this._devices || []) {
+      for (const id of Object.values(device.entities || {})) {
+        const st = this._hass.states[id];
+        parts.push(
+          id + "=" + (st
+            ? st.state + "|" + (st.attributes.temperature != null ? st.attributes.temperature : "") +
+              "|" + (st.attributes.current_temperature != null ? st.attributes.current_temperature : "") +
+              "|" + (st.attributes.brightness != null ? st.attributes.brightness : "") +
+              "|" + (Array.isArray(st.attributes.rgbw_color) ? st.attributes.rgbw_color.join(",") : "")
+            : "")
+        );
+      }
     }
     return parts.join(";");
   }
@@ -126,7 +130,7 @@ class AquaelLinkPanel extends HTMLElement {
     const opt = this._optimisticSwitch;
     if (opt && opt.id === entityId) {
       if (state && state.state === opt.state) {
-        this._optimisticSwitch = null; // device caught up
+        this._optimisticSwitch = null;
       } else {
         return opt.state === "on";
       }
@@ -134,12 +138,12 @@ class AquaelLinkPanel extends HTMLElement {
     return state && state.state === "on";
   }
 
-  // Value shown in the UI: pending (not yet confirmed) value wins over entity state.
+
   _pendingNumber(entityId, fallback) {
     if (entityId && this._pending[entityId] != null) {
       const real = this._numberState(entityId, NaN);
       if (Number.isFinite(real) && Math.abs(real - this._pending[entityId]) < 0.001) {
-        delete this._pending[entityId]; // device caught up
+        delete this._pending[entityId];
         return real;
       }
       return this._pending[entityId];
@@ -147,7 +151,7 @@ class AquaelLinkPanel extends HTMLElement {
     return this._numberState(entityId, fallback);
   }
 
-  // Accumulate rapid +/- clicks locally, send the final value once after a short pause.
+
   _bumpNumber(entityId, delta, min, max, fallback) {
     if (!entityId) {
       return;
@@ -185,6 +189,262 @@ class AquaelLinkPanel extends HTMLElement {
       return null;
     }
     return ["on", "true", "tak", "yes", "1"].includes(String(state.state).toLowerCase());
+  }
+
+  _deviceByType(type) {
+    return (this._devices || []).find((device) => device.type === type) || null;
+  }
+
+  _aquariumDevices() {
+    return {
+      hypermax: this._deviceByType("hypermax"),
+      thermometer: this._deviceByType("thermometer"),
+      light: this._deviceByType("light"),
+      socket: this._deviceByType("socket"),
+    };
+  }
+
+  _formatTemp(value) {
+    return Number.isFinite(value) ? `${value.toFixed(1)}°C` : "—";
+  }
+
+  _formatPct(value) {
+    return Number.isFinite(value) ? `${Math.round(value)}%` : "—";
+  }
+
+  _socketModeLabel(entityId) {
+    const state = this._entity(entityId);
+    if (!state || state.state === "unknown" || state.state === "unavailable") {
+      return "—";
+    }
+    const labels = { Dzien: "Day", Swit: "Daybreak", Noc: "Night", Wlaczone: "On", Wylaczone: "Off" };
+    return labels[state.state] || state.state;
+  }
+
+  _loadTankPhoto() {
+    try {
+      return window.localStorage ? window.localStorage.getItem("aquaelLinkTankPhoto") || "" : "";
+    } catch (err) {
+      return "";
+    }
+  }
+
+  _saveTankPhoto(dataUrl) {
+    this._tankPhoto = dataUrl || "";
+    try {
+      if (window.localStorage) {
+        if (this._tankPhoto) {
+          window.localStorage.setItem("aquaelLinkTankPhoto", this._tankPhoto);
+        } else {
+          window.localStorage.removeItem("aquaelLinkTankPhoto");
+        }
+      }
+    } catch (err) {
+      this._showToast("Zdjęcie działa w tej sesji, ale przeglądarka nie zapisała go lokalnie");
+    }
+  }
+
+  _resizeTankPhoto(file) {
+    return new Promise((resolve, reject) => {
+      if (!file || !file.type || !file.type.startsWith("image/")) {
+        reject(new Error("Wybierz plik graficzny"));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Nie mogę odczytać zdjęcia"));
+      reader.onload = () => {
+        const image = new Image();
+        image.onerror = () => reject(new Error("Nie mogę przygotować podglądu"));
+        image.onload = () => {
+          const maxSide = 1400;
+          const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+          const width = Math.max(1, Math.round(image.width * scale));
+          const height = Math.max(1, Math.round(image.height * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(image, 0, 0, width, height);
+          resolve(canvas.toDataURL("image/jpeg", 0.84));
+        };
+        image.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  _renderAquariumCockpit() {
+    const devices = this._aquariumDevices();
+    if (!devices.hypermax && !devices.thermometer && !devices.light && !devices.socket) {
+      return "";
+    }
+    const h = (devices.hypermax && devices.hypermax.entities) || {};
+    const t = (devices.thermometer && devices.thermometer.entities) || {};
+    const l = (devices.light && devices.light.entities) || {};
+    const s = (devices.socket && devices.socket.entities) || {};
+    const climate = this._entity(h.thermostat);
+    const thermometerWater = this._numberState(t.water_temperature, NaN);
+    const hyperCurrent = climate && climate.attributes.current_temperature != null
+      ? Number(climate.attributes.current_temperature)
+      : this._numberState(h.current_temperature, NaN);
+    const waterTemp = Number.isFinite(thermometerWater) ? thermometerWater : hyperCurrent;
+    const target = climate && climate.attributes.temperature != null
+      ? Number(climate.attributes.temperature)
+      : this._numberState(h.target_temperature, NaN);
+    const efficiency = this._numberState(h.filter_efficiency, NaN);
+    const topPower = this._numberState(h.top_heater_power, 0);
+    const bottomPower = this._numberState(h.bottom_heater_power, 0);
+    const heaterPower = topPower + bottomPower;
+    const thermostatOn = climate ? climate.state === "heat" : this._isOn(h.thermostat_switch);
+    const pumpOn = this._isOn(h.pump);
+    const light = this._entity(l.light);
+    const lightOn = light && light.state === "on";
+    const red = this._numberState(l.light_red, NaN);
+    const blue = this._numberState(l.light_blue, NaN);
+    const white = this._numberState(l.light_white, NaN);
+    const ch1On = this._isOn(s.output_1);
+    const ch2On = this._isOn(s.output_2);
+    const ch1Mode = this._socketModeLabel(s.output_1_mode);
+    const ch2Mode = this._socketModeLabel(s.output_2_mode);
+    const tempState =!Number.isFinite(waterTemp)
+      ? "muted"
+      : waterTemp < 24.0
+        ? "cold"
+        : waterTemp > 27.0
+          ? "warm"
+          : "ok";
+    const tempText = tempState === "cold"
+      ? "za zimno"
+      : tempState === "warm"
+        ? "za ciepło"
+        : tempState === "ok"
+          ? "stabilnie"
+          : "czekam na pomiar";
+    const heatingText = !devices.hypermax
+      ? "—"
+      : thermostatOn
+        ? (heaterPower > 0 ? "grzałki " + Math.round(heaterPower) + "%" : "gotowy")
+        : "wyłączony";
+    const filterText = !devices.hypermax ? "—" : pumpOn ? this._formatPct(efficiency) : "wył.";
+    const filterSub = !devices.hypermax ? "" : pumpOn ? "pompa pracuje" : "pompa zatrzymana";
+    const lightText = !devices.light
+      ? "—"
+      : lightOn
+        ? [Number.isFinite(white) ? "W " + Math.round(white) : "", Number.isFinite(blue) ? "B " + Math.round(blue) : "", Number.isFinite(red) ? "R " + Math.round(red) : ""].filter(Boolean).join(" · ") || "włączone"
+        : "wyłączone";
+    return `
+    <section class="aquarium-card">
+      <div class="aq-card-header">
+        <strong>Akwarium</strong>
+        <div class="aq-photo-controls">
+          ${this._tankPhoto ? `
+            <button class="aq-photo-btn" type="button" data-aq-photo-clear title="Usuń zdjęcie">
+              <ha-icon icon="mdi:image-off-outline"></ha-icon>
+            </button>
+          ` : ""}
+          <label class="aq-photo-btn" title="Dodaj zdjęcie akwarium">
+            <ha-icon icon="mdi:camera-outline"></ha-icon>
+            <input type="file" accept="image/*" data-aq-photo-input>
+          </label>
+        </div>
+      </div>
+
+      <div class="aq-tank-strip"><img src="${this._escape(this._tankPhoto || (PANEL_STATIC_URL + "/aq-default-tank.jpg"))}" alt="Akwarium"></div>
+
+      <div class="aq-metrics">
+        <div class="aq-metric ${tempState}">
+          <span>Temperatura</span>
+          <strong>${this._escape(this._formatTemp(waterTemp))}</strong>
+          <small>${this._escape(tempText)}</small>
+        </div>
+        ${devices.hypermax ? `
+        <div class="aq-metric">
+          <span>Termostat</span>
+          <strong>${this._escape(this._formatTemp(target))}</strong>
+          <small>${this._escape(heatingText)}</small>
+        </div>
+        ` : ""}
+        ${devices.hypermax ? `
+        <div class="aq-metric">
+          <span>Filtr</span>
+          <strong>${this._escape(filterText)}</strong>
+          <small>${this._escape(filterSub)}</small>
+        </div>
+        ` : ""}
+        ${devices.light ? `
+        <div class="aq-metric">
+          <span>Światło</span>
+          <strong>${lightOn ? "wł." : "wył."}</strong>
+          <small>${this._escape(lightText)}</small>
+        </div>
+        ` : ""}
+        ${devices.socket ? `
+        <div class="aq-metric">
+          <span>Kanał 1</span>
+          <strong>${ch1On ? this._escape(ch1Mode) : "wył."}</strong>
+          <small>${ch1On ? "Day&amp;Night" : ""}</small>
+        </div>
+        <div class="aq-metric">
+          <span>Kanał 2</span>
+          <strong>${ch2On ? this._escape(ch2Mode) : "wył."}</strong>
+          <small>${ch2On ? "Day&amp;Night" : ""}</small>
+        </div>
+        ` : ""}
+      </div>
+
+      <div class="aq-controls">
+        ${devices.light ? `
+        <div class="aq-ctrl-group">
+          <div class="aq-ctrl-label"><ha-icon icon="mdi:lightbulb-outline"></ha-icon>Preset lampy</div>
+          <div class="aq-ctrl-btns">
+            <button data-aq-light="preset_plant"><ha-icon icon="mdi:leaf"></ha-icon>Roślinny</button>
+            <button data-aq-light="preset_sunny"><ha-icon icon="mdi:white-balance-sunny"></ha-icon>Słoneczny</button>
+            <button data-aq-light="preset_marine"><ha-icon icon="mdi:waves"></ha-icon>Marine</button>
+            <button data-aq-light="off"><ha-icon icon="mdi:power"></ha-icon>Wyłącz</button>
+          </div>
+          <div class="aq-channel-board">
+            ${this._renderLightChannelSlider("red", "R", "mdi:circle", red)}
+            ${this._renderLightChannelSlider("blue", "B", "mdi:circle", blue)}
+            ${this._renderLightChannelSlider("white", "W", "mdi:white-balance-sunny", white)}
+          </div>
+        </div>
+        ` : ""}
+        ${devices.socket ? `
+        <div class="aq-ctrl-group">
+          <div class="aq-ctrl-label"><ha-icon icon="mdi:theme-light-dark"></ha-icon>Day&amp;Night</div>
+          <div class="aq-socket-channel">
+            <div class="aq-socket-ch-head">
+              <span>Kanał 1</span>
+              <button class="aq-socket-toggle ${ch1On ? "active" : ""}" data-aq-socket="1:toggle">
+                <ha-icon icon="mdi:power"></ha-icon>${ch1On ? "On" : "Off"}
+              </button>
+            </div>
+            ${ch1On ? `
+            <div class="aq-ctrl-btns">
+              <button data-aq-socket="1:Swit"><ha-icon icon="mdi:weather-sunset-up"></ha-icon>Daybreak</button>
+              <button data-aq-socket="1:Dzien"><ha-icon icon="mdi:white-balance-sunny"></ha-icon>Day</button>
+              <button data-aq-socket="1:Noc"><ha-icon icon="mdi:weather-night"></ha-icon>Night</button>
+            </div>` : ""}
+          </div>
+          <div class="aq-socket-channel">
+            <div class="aq-socket-ch-head">
+              <span>Kanał 2</span>
+              <button class="aq-socket-toggle ${ch2On ? "active" : ""}" data-aq-socket="2:toggle">
+                <ha-icon icon="mdi:power"></ha-icon>${ch2On ? "On" : "Off"}
+              </button>
+            </div>
+            ${ch2On ? `
+            <div class="aq-ctrl-btns">
+              <button data-aq-socket="2:Swit"><ha-icon icon="mdi:weather-sunset-up"></ha-icon>Daybreak</button>
+              <button data-aq-socket="2:Dzien"><ha-icon icon="mdi:white-balance-sunny"></ha-icon>Day</button>
+              <button data-aq-socket="2:Noc"><ha-icon icon="mdi:weather-night"></ha-icon>Night</button>
+            </div>` : ""}
+          </div>
+        </div>
+        ` : ""}
+      </div>
+    </section>
+  `;
   }
 
   _renderDeviceButton(device) {
@@ -267,7 +527,7 @@ class AquaelLinkPanel extends HTMLElement {
     })();
     const items = [
       ["settings", "mdi:cog-outline", "Ustawienia", "Szczegóły i preferencje urządzenia"],
-      ["flow", "mdi:waves", "Program pracy", "Wybierz program pracy urządzenia"],
+      ["flow", "mdi:pump", "Wydajność filtra", "Ustaw wydajność i tryb pracy pompy"],
       ["thermostat", "mdi:thermometer", "Termostatowanie", "Zarządzaj termostatowaniem"],
       ["chart", "mdi:chart-line", "Temperatura", "Zobacz historię"],
       ["security", "mdi:lock-outline", "Bezpieczeństwo", "Zabezpiecz dostęp kodem PIN"],
@@ -362,10 +622,12 @@ class AquaelLinkPanel extends HTMLElement {
 
   _renderHypermaxChart(device) {
     const url = device.chart_url || "";
+    const token = (this._hass && this._hass.auth && this._hass.auth.data && this._hass.auth.data.access_token) || "";
+    const chartUrl = url ? `${url}#${new URLSearchParams({ token }).toString()}` : "";
     return `
       <div class="ios-screen ios-control-screen" style="position:relative;">
         <button class="ios-back ios-back--float" data-mode="menu" aria-label="Wróć"></button>
-        ${url ? `<iframe class="hypermax-frame hypermax-frame--full" src="${this._escape(url)}"></iframe>` : `<div class="empty">Brak wykresu dla tego urządzenia.</div>`}
+        ${chartUrl ? `<iframe class="hypermax-frame hypermax-frame--full" src="${this._escape(chartUrl)}"></iframe>` : `<div class="empty">Brak wykresu dla tego urządzenia.</div>`}
       </div>
     `;
   }
@@ -526,7 +788,7 @@ class AquaelLinkPanel extends HTMLElement {
       await this._callService("number", "set_value", { entity_id: entities.filter_efficiency, value: next });
     } else if (action === "toggle-notify" && entities.notify) {
       const on = this._isOn(entities.notify);
-      // Optimistic flip so the switch reacts instantly.
+
       this._optimisticSwitch = { id: entities.notify, state: on ? "off" : "on" };
       this._render();
       try {
@@ -563,6 +825,162 @@ class AquaelLinkPanel extends HTMLElement {
         this._showToast("Kod PIN musi mieć dokładnie 6 cyfr");
       }
     }
+  }
+
+  async _setSwitchEntity(entityId, on) {
+    if (!entityId) {
+      return;
+    }
+    await this._callService("switch", on ? "turn_on" : "turn_off", { entity_id: entityId });
+  }
+
+  async _setNumberEntity(entityId, value) {
+    if (!entityId || !Number.isFinite(value)) {
+      return;
+    }
+    await this._callService("number", "set_value", { entity_id: entityId, value });
+  }
+
+  async _setSelectEntity(entityId, option) {
+    if (!entityId || !option) {
+      return;
+    }
+    await this._callService("select", "select_option", { entity_id: entityId, option });
+  }
+
+  async _pressEntity(entityId) {
+    if (!entityId) {
+      return;
+    }
+    await this._callService("button", "press", { entity_id: entityId });
+  }
+
+  async _setLightChannels(entities, red, blue, white) {
+    if (!entities || !entities.light) {
+      return;
+    }
+    const to255 = (value) => Math.max(0, Math.min(255, Math.round(value * 255 / 100)));
+    await this._callService("light", "turn_on", {
+      entity_id: entities.light,
+      rgbw_color: [to255(red), 0, to255(blue), to255(white)],
+    });
+  }
+
+  async _turnLightOff(entities) {
+    if (!entities || !entities.light) {
+      return;
+    }
+    await this._callService("light", "turn_off", { entity_id: entities.light });
+  }
+
+  async _applyHypermaxTarget(entities, target, efficiency, heaterOn = true, pumpOn = true) {
+    if (!entities) {
+      return;
+    }
+    await this._setSwitchEntity(entities.pump, pumpOn);
+    if (entities.thermostat) {
+      await this._callService("climate", "set_hvac_mode", {
+        entity_id: entities.thermostat,
+        hvac_mode: heaterOn ? "heat" : "off",
+      });
+      if (heaterOn && Number.isFinite(target)) {
+        await this._callService("climate", "set_temperature", {
+          entity_id: entities.thermostat,
+          temperature: target,
+        });
+      }
+    } else {
+      await this._setSwitchEntity(entities.thermostat_switch, heaterOn);
+      await this._setNumberEntity(entities.target_temperature, target);
+    }
+    await this._setNumberEntity(entities.filter_efficiency, efficiency);
+  }
+
+  async _setSocketDayNight(entities, mode1, mode2) {
+    if (!entities) {
+      return;
+    }
+    await this._setSwitchEntity(entities.auto_mode, false);
+    await this._setSelectEntity(entities.output_1_mode, mode1);
+    await this._setSelectEntity(entities.output_2_mode, mode2);
+  }
+
+  async _applyLightPreset(entities, presetKey) {
+    if (!entities) {
+      return;
+    }
+    await this._setSwitchEntity(entities.auto_mode, false);
+    if (entities[presetKey]) {
+      await this._pressEntity(entities[presetKey]);
+      return;
+    }
+    if (presetKey === "preset_marine") {
+      await this._setLightChannels(entities, 0, 80, 70);
+    } else {
+      await this._setLightChannels(entities, 70, 80, 55);
+    }
+  }
+
+  async _handleLightAction(action) {
+    const device = this._selected && this._selected.type === "light" ? this._selected : this._deviceByType("light");
+    const entities = (device && device.entities) || {};
+    try {
+      if (action === "off") {
+        await this._turnLightOff(entities);
+        this._showToast("Lampa wyłączona");
+      } else {
+        await this._applyLightPreset(entities, action);
+        this._showToast("Preset lampy ustawiony");
+      }
+    } catch (err) {
+      this._showToast("Błąd lampy: " + ((err && err.message) || err));
+    }
+    this._render();
+  }
+
+  async _handleLightChannel(channel, value) {
+    const device = this._selected && this._selected.type === "light" ? this._selected : this._deviceByType("light");
+    const entities = (device && device.entities) || {};
+    const numberEntity = channel === "red"
+      ? entities.light_red
+      : channel === "blue"
+        ? entities.light_blue
+        : entities.light_white;
+    const numeric = Math.max(0, Math.min(100, Math.round(Number(value))));
+    try {
+      await this._setSwitchEntity(entities.auto_mode, false);
+      await this._setNumberEntity(numberEntity, numeric);
+      this._showToast("Kanał " + channel + " ustawiony na " + numeric + "%");
+    } catch (err) {
+      this._showToast("Błąd lampy: " + ((err && err.message) || err));
+    }
+    this._render();
+  }
+
+  async _handleSocketMode(action) {
+    const device = this._selected && this._selected.type === "socket" ? this._selected : this._deviceByType("socket");
+    const entities = (device && device.entities) || {};
+    const [ch, cmd] = String(action || "").split(":");
+    const switchEntity = ch === "1" ? entities.output_1 : entities.output_2;
+    const modeEntity = ch === "1" ? entities.output_1_mode : entities.output_2_mode;
+    try {
+      if (cmd === "toggle") {
+        if (switchEntity) {
+          await this._callService("switch", this._isOn(switchEntity) ? "turn_off" : "turn_on", { entity_id: switchEntity });
+        }
+      } else {
+        if (switchEntity) {
+          await this._callService("switch", "turn_on", { entity_id: switchEntity });
+        }
+        if (modeEntity) {
+          await this._setSelectEntity(modeEntity, cmd);
+        }
+        this._showToast("Kanał " + ch + ": " + cmd);
+      }
+    } catch (err) {
+      this._showToast("Błąd socketu: " + ((err && err.message) || err));
+    }
+    this._render();
   }
 
   async _setPin(enabled, code) {
@@ -629,15 +1047,104 @@ class AquaelLinkPanel extends HTMLElement {
     if (!this._selected) {
       return `<div class="empty">Brak urządzeń dodanych do panelu Aquael Link.</div>`;
     }
+    const cockpit = this._renderAquariumCockpit();
+    let body = "";
     if (this._selected.type === "hypermax") {
-      return this._renderHypermax(this._selected);
-    }
-    if (this._selected.chart_url) {
+      body = this._renderHypermax(this._selected);
+    } else if (this._selected.type === "light") {
+      body = this._renderLightPanel(this._selected);
+    } else if (this._selected.type === "socket") {
+      body = this._renderSocketPanel(this._selected);
+    } else if (this._selected.chart_url) {
       const token = (this._hass && this._hass.auth && this._hass.auth.data && this._hass.auth.data.access_token) || "";
       const url = `${this._selected.chart_url}#${new URLSearchParams({ token }).toString()}`;
-      return `<iframe title="${this._escape(this._selected.name)}" src="${this._escape(url)}"></iframe>`;
+      body = `<iframe title="${this._escape(this._selected.name)}" src="${this._escape(url)}"></iframe>`;
+    } else {
+      body = `<div class="empty">Brak widoku panelu dla tego urządzenia.</div>`;
     }
-    return `<div class="empty">Brak widoku panelu dla tego urządzenia.</div>`;
+    return `${cockpit}<div class="device-detail">${body}</div>`;
+  }
+
+  _renderLightPanel(device) {
+    const entities = device.entities || {};
+    const red = this._numberState(entities.light_red, NaN);
+    const blue = this._numberState(entities.light_blue, NaN);
+    const white = this._numberState(entities.light_white, NaN);
+    const on = this._entity(entities.light);
+    return `
+      <section class="hm-screen">
+        <div class="hm-card aq-device-panel">
+          <div class="aq-device-panel__media"><img src="${PANEL_STATIC_URL}/ios-light.png" alt=""></div>
+          <div class="aq-device-panel__body">
+            <h3>${this._escape(device.name || "LEDDY Slim Link")}</h3>
+            <p>${on && on.state === "on" ? "Światło aktywne" : "Światło wyłączone"} · R ${this._formatPct(red)} · B ${this._formatPct(blue)} · W ${this._formatPct(white)}</p>
+            <div class="aq-inline-actions">
+              <button data-aq-light="preset_plant"><ha-icon icon="mdi:leaf"></ha-icon>Plant</button>
+              <button data-aq-light="preset_sunny"><ha-icon icon="mdi:white-balance-sunny"></ha-icon>Sunny</button>
+              <button data-aq-light="preset_marine"><ha-icon icon="mdi:waves"></ha-icon>Marine</button>
+              <button data-aq-light="off"><ha-icon icon="mdi:power"></ha-icon>Off</button>
+            </div>
+            <div class="aq-channel-board">
+              ${this._renderLightChannelSlider("red", "Czerwony", "mdi:circle", red)}
+              ${this._renderLightChannelSlider("blue", "Niebieski", "mdi:circle", blue)}
+              ${this._renderLightChannelSlider("white", "Biały", "mdi:white-balance-sunny", white)}
+            </div>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  _renderLightChannelSlider(channel, label, icon, value) {
+    const safe = Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value))) : 0;
+    return `
+      <label class="aq-channel aq-channel--${this._escape(channel)}">
+        <span>
+          <ha-icon icon="${this._escape(icon)}"></ha-icon>
+          <b>${this._escape(label)}</b>
+        </span>
+        <input type="range" min="0" max="100" step="1" value="${safe}" data-aq-light-channel="${this._escape(channel)}">
+        <strong data-aq-light-value="${this._escape(channel)}">${safe}%</strong>
+      </label>
+    `;
+  }
+
+  _renderSocketPanel(device) {
+    const entities = device.entities || {};
+    const ch1On = this._isOn(entities.output_1);
+    const ch2On = this._isOn(entities.output_2);
+    const ch1Mode = this._socketModeLabel(entities.output_1_mode);
+    const ch2Mode = this._socketModeLabel(entities.output_2_mode);
+    const renderChannel = (ch, isOn, mode) => `
+      <div class="aq-socket-channel">
+        <div class="aq-socket-ch-head">
+          <span>Kanał ${ch}</span>
+          <button class="aq-socket-toggle ${isOn ? "active" : ""}" data-aq-socket="${ch}:toggle">
+            <ha-icon icon="mdi:power"></ha-icon>${isOn ? "On" : "Off"}
+          </button>
+        </div>
+        ${isOn ? `
+        <div class="aq-ctrl-btns">
+          <button data-aq-socket="${ch}:Swit"><ha-icon icon="mdi:weather-sunset-up"></ha-icon>Daybreak</button>
+          <button data-aq-socket="${ch}:Dzien"><ha-icon icon="mdi:white-balance-sunny"></ha-icon>Day</button>
+          <button data-aq-socket="${ch}:Noc"><ha-icon icon="mdi:weather-night"></ha-icon>Night</button>
+        </div>
+        <p class="aq-socket-mode-label">aktywny tryb: <strong>${this._escape(mode)}</strong></p>
+        ` : ""}
+      </div>
+    `;
+    return `
+      <section class="hm-screen">
+        <div class="hm-card aq-device-panel">
+          <div class="aq-device-panel__media"><img src="${PANEL_STATIC_URL}/ios-socket-duo.png" alt=""></div>
+          <div class="aq-device-panel__body">
+            <h3>${this._escape(device.name || "Socket Duo Link")}</h3>
+            ${renderChannel(1, ch1On, ch1Mode)}
+            ${renderChannel(2, ch2On, ch2Mode)}
+          </div>
+        </div>
+      </section>
+    `;
   }
 
   _render() {
@@ -646,7 +1153,10 @@ class AquaelLinkPanel extends HTMLElement {
     }
     const sel = this._selected;
     const selMode = sel && this._hypermaxModes ? this._hypermaxModes[sel.entry_id] : null;
-    this._iframeMode = !!(sel && sel.type === "hypermax" && (selMode === "flow" || selMode === "thermostat" || selMode === "chart"));
+    this._iframeMode = !!(sel && (
+      (sel.type === "hypermax" && (selMode === "flow" || selMode === "thermostat" || selMode === "chart")) ||
+      sel.type === "thermometer"
+    ));
     this.shadowRoot.innerHTML = `
       <style>
         :host {
@@ -721,12 +1231,274 @@ class AquaelLinkPanel extends HTMLElement {
         main {
           min-width: 0;
           min-height: 100%;
+          padding: 16px;
+          box-sizing: border-box;
         }
         iframe {
           border: 0;
           width: 100%;
           height: calc(100vh - var(--header-height, 56px));
           background: white;
+        }
+        .device-detail {
+          margin-top: 16px;
+        }
+        .device-detail > iframe,
+        .device-detail > .hypermax-shell {
+          border-radius: 8px;
+          overflow: hidden;
+          border: 1px solid var(--divider-color);
+        }
+        .aquarium-card {
+          position: relative;
+          overflow: hidden;
+          border: 1px solid var(--divider-color);
+          border-radius: 8px;
+          background:
+            linear-gradient(135deg, rgba(12, 75, 91, 0.10), rgba(62, 126, 92, 0.08) 44%, rgba(243, 167, 65, 0.10)),
+            var(--card-background-color);
+          box-shadow: var(--ha-card-box-shadow, none);
+        }
+        .aq-metrics {
+          display: grid;
+          grid-template-columns: repeat(6, minmax(0, 1fr));
+          gap: 1px;
+          border-top: 1px solid var(--divider-color);
+          border-bottom: 1px solid var(--divider-color);
+          background: var(--divider-color);
+        }
+        .aq-metric {
+          min-width: 0;
+          padding: 14px 12px;
+          background: var(--card-background-color);
+        }
+        .aq-metric span,
+        .aq-metric small {
+          display: block;
+          overflow-wrap: anywhere;
+        }
+        .aq-metric span {
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }
+        .aq-metric strong {
+          display: block;
+          margin-top: 5px;
+          font-size: 24px;
+          line-height: 1.05;
+          color: var(--primary-text-color);
+        }
+        .aq-metric small {
+          margin-top: 5px;
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          line-height: 1.25;
+        }
+        .aq-metric.ok strong { color: #2e7d32; }
+        .aq-metric.cold strong { color: #0277bd; }
+        .aq-metric.warm strong { color: #d84315; }
+        .aq-socket-channel { margin-top: 8px; }
+        .aq-socket-ch-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          margin-bottom: 6px;
+        }
+        .aq-socket-ch-head span { font-size: 13px; font-weight: 600; }
+        .aq-socket-toggle {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          padding: 3px 10px;
+          border-radius: 6px;
+          border: 1px solid var(--divider-color);
+          background: var(--card-background-color);
+          color: var(--primary-text-color);
+          font: inherit;
+          font-size: 12px;
+          cursor: pointer;
+        }
+        .aq-socket-toggle.active {
+          background: var(--primary-color);
+          color: #fff;
+          border-color: var(--primary-color);
+        }
+        .aq-socket-toggle ha-icon { --mdc-icon-size: 14px; }
+        .aq-socket-mode-label { font-size: 12px; color: var(--secondary-text-color); margin: 4px 0 0; }
+        .aq-card-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 14px 16px;
+        }
+        .aq-card-header strong {
+          font-size: 11px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          color: var(--secondary-text-color);
+        }
+        .aq-photo-controls {
+          display: flex;
+          gap: 6px;
+        }
+        .aq-photo-btn {
+          width: 30px;
+          height: 30px;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          background: transparent;
+          color: var(--secondary-text-color);
+          cursor: pointer;
+          display: grid;
+          place-items: center;
+          --mdc-icon-size: 17px;
+        }
+        .aq-photo-btn input { display: none; }
+        .aq-photo-btn:hover { color: var(--primary-color); border-color: var(--primary-color); }
+        .aq-tank-strip {
+          width: 100%;
+          height: 150px;
+          overflow: hidden;
+          border-bottom: 1px solid var(--divider-color);
+        }
+        .aq-tank-strip img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+          display: block;
+        }
+        .aq-controls {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 1px;
+          background: var(--divider-color);
+        }
+        .aq-ctrl-group {
+          flex: 1 1 200px;
+          min-width: 0;
+          background: var(--card-background-color);
+          padding: 14px 16px;
+        }
+        .aq-ctrl-label {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 11px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          color: var(--secondary-text-color);
+          margin-bottom: 10px;
+        }
+        .aq-ctrl-label ha-icon { --mdc-icon-size: 15px; color: var(--primary-color); }
+        .aq-ctrl-btns {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .aq-ctrl-btns button {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          padding: 0 12px;
+          min-height: 34px;
+          border: 1px solid var(--divider-color);
+          border-radius: 6px;
+          background: var(--card-background-color);
+          color: var(--primary-text-color);
+          font: inherit;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .aq-ctrl-btns button:hover {
+          border-color: var(--primary-color);
+          color: var(--primary-color);
+          box-shadow: inset 0 0 0 1px var(--primary-color);
+        }
+        .aq-ctrl-btns ha-icon { --mdc-icon-size: 15px; color: var(--primary-color); }
+        .aq-device-panel {
+          display: grid;
+          grid-template-columns: 120px 1fr;
+          gap: 18px;
+          padding: 18px;
+          align-items: center;
+        }
+        .aq-device-panel__media {
+          display: grid;
+          place-items: center;
+          min-height: 120px;
+        }
+        .aq-device-panel__media img {
+          max-width: 110px;
+          max-height: 110px;
+          object-fit: contain;
+        }
+        .aq-device-panel__body h3 {
+          margin: 0 0 6px;
+          font-size: 22px;
+          line-height: 1.15;
+        }
+        .aq-device-panel__body p {
+          margin: 0 0 14px;
+          color: var(--secondary-text-color);
+        }
+        .aq-inline-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+        .aq-inline-actions button {
+          min-height: 38px;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          padding: 0 12px;
+          font-weight: 700;
+        }
+        .aq-inline-actions ha-icon {
+          --mdc-icon-size: 18px;
+          color: var(--primary-color);
+        }
+        .aq-channel-board {
+          display: grid;
+          gap: 10px;
+          margin-top: 16px;
+        }
+        .aq-channel {
+          display: grid;
+          grid-template-columns: 120px minmax(120px, 1fr) 56px;
+          align-items: center;
+          gap: 12px;
+          padding: 12px;
+          border: 1px solid var(--divider-color);
+          border-radius: 8px;
+          background: rgba(127, 127, 127, 0.06);
+        }
+        .aq-channel span {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          min-width: 0;
+          font-weight: 700;
+        }
+        .aq-channel ha-icon {
+          --mdc-icon-size: 18px;
+        }
+        .aq-channel--red ha-icon { color: #d32f2f; }
+        .aq-channel--blue ha-icon { color: #1976d2; }
+        .aq-channel--white ha-icon { color: #f9a825; }
+        .aq-channel input[type="range"] {
+          width: 100%;
+          accent-color: var(--primary-color);
+        }
+        .aq-channel strong {
+          text-align: right;
+          font-size: 15px;
         }
         .hypermax-shell {
           min-height: calc(100vh - var(--header-height, 56px));
@@ -1190,6 +1962,7 @@ class AquaelLinkPanel extends HTMLElement {
           height: min(820px, calc(100vh - var(--header-height, 56px)));
           min-height: 0;
           background: #ffffff;
+          margin: 0 auto;
         }
         .ios-slider {
           width: min(72%, 520px);
@@ -1443,9 +2216,32 @@ class AquaelLinkPanel extends HTMLElement {
           padding: 24px;
           color: var(--secondary-text-color);
         }
+        @media (max-width: 1180px) {
+          .aq-metrics {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+          }
+        }
         @media (max-width: 720px) {
           .shell {
             grid-template-columns: 1fr;
+          }
+          main {
+            padding: 12px;
+          }
+          .aq-metrics {
+            grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+          }
+          .aq-metric strong {
+            font-size: 21px;
+          }
+          .aq-device-panel {
+            grid-template-columns: 1fr;
+          }
+          .aq-channel {
+            grid-template-columns: 1fr;
+          }
+          .aq-channel strong {
+            text-align: left;
           }
           aside {
             border-right: 0;
@@ -1492,6 +2288,57 @@ class AquaelLinkPanel extends HTMLElement {
     for (const button of this.shadowRoot.querySelectorAll("[data-action]")) {
       button.addEventListener("click", () => {
         this._handleHypermaxAction(button.dataset.action);
+      });
+    }
+    const tankPhotoInput = this.shadowRoot.querySelector("[data-aq-photo-input]");
+    if (tankPhotoInput) {
+      tankPhotoInput.addEventListener("change", async () => {
+        const file = tankPhotoInput.files && tankPhotoInput.files[0];
+        if (!file) {
+          return;
+        }
+        try {
+          const dataUrl = await this._resizeTankPhoto(file);
+          this._saveTankPhoto(dataUrl);
+          this._showToast("Zdjęcie akwarium dodane");
+          this._render();
+        } catch (err) {
+          this._showToast(err && err.message ? err.message : "Nie udało się dodać zdjęcia");
+        } finally {
+          tankPhotoInput.value = "";
+        }
+      });
+    }
+    const tankPhotoClear = this.shadowRoot.querySelector("[data-aq-photo-clear]");
+    if (tankPhotoClear) {
+      tankPhotoClear.addEventListener("click", () => {
+        this._saveTankPhoto("");
+        this._showToast("Zdjęcie akwarium usunięte");
+        this._render();
+      });
+    }
+    for (const button of this.shadowRoot.querySelectorAll("[data-aq-light]")) {
+      button.addEventListener("click", () => {
+        this._handleLightAction(button.dataset.aqLight);
+      });
+    }
+    for (const button of this.shadowRoot.querySelectorAll("[data-aq-socket]")) {
+      button.addEventListener("click", () => {
+        this._handleSocketMode(button.dataset.aqSocket);
+      });
+    }
+    for (const slider of this.shadowRoot.querySelectorAll("[data-aq-light-channel]")) {
+      const channel = slider.dataset.aqLightChannel;
+      const label = this.shadowRoot.querySelector(`[data-aq-light-value="${channel}"]`);
+      slider.addEventListener("input", () => {
+        this._dragging = true;
+        if (label) {
+          label.textContent = Math.round(Number(slider.value)) + "%";
+        }
+      });
+      slider.addEventListener("change", async () => {
+        this._dragging = false;
+        await this._handleLightChannel(channel, slider.value);
       });
     }
     for (const button of this.shadowRoot.querySelectorAll("[data-rename]")) {
@@ -1608,4 +2455,6 @@ class AquaelLinkPanel extends HTMLElement {
   }
 }
 
-customElements.define("aquael-link-panel-v6", AquaelLinkPanel);
+if (!customElements.get("aquael-link-panel-v6")) {
+  customElements.define("aquael-link-panel-v6", AquaelLinkPanel);
+}

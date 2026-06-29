@@ -657,7 +657,9 @@
 </div>
 
 <script>
-var DEVBASE=(function(){var p=new URLSearchParams(window.location.search);var ip=p.get("ip");return ip?("http://"+ip+"/"):"";})();
+var DEVBASE=(function(){var p=new URLSearchParams(window.location.search);var entry=p.get("entry_id");var ip=p.get("ip");if(entry)return"/api/aquael_link/hypermax/"+encodeURIComponent(entry)+"/";return ip?("http://"+ip+"/"):"";})();
+var HA_TOKEN_SOURCE="";
+var HA_TOKEN=(function(){var h=new URLSearchParams(window.location.hash.slice(1));var token=h.get("token")||"";if(token){HA_TOKEN_SOURCE="hash";return token;}try{var raw=window.localStorage&&window.localStorage.getItem("hassTokens");if(raw){var parsed=JSON.parse(raw);token=(parsed&&parsed.access_token)||"";if(token){HA_TOKEN_SOURCE="localStorage";return token;}}}catch(err){}HA_TOKEN_SOURCE="missing";return"";})();
 var MAX_VALID_TIMESTAMP_MS = 2372506735000;
 document.getElementById("LangElement").lang="PL";
 </script>
@@ -671,6 +673,18 @@ document.getElementById("LangElement").lang="PL";
 <script src="../aquael_thermometer/jquery.csv.min.js"></script>
 
 <script>
+        function aqAuthHeaders(url) {
+            return HA_TOKEN && String(url || "").indexOf("/api/") === 0 ? {"Authorization": "Bearer " + HA_TOKEN} : {};
+        }
+
+        function aqGet(url, success) {
+            var headers = aqAuthHeaders(url);
+            if (Object.keys(headers).length) {
+                return $.ajax({url: url, method: "GET", headers: headers, success: success});
+            }
+            return $.get(url, success);
+        }
+
         var ActualTemp = document.getElementById("my"),
             ActualTempData = document.getElementById("myp"),
             TempMAX = document.getElementById("my3"),
@@ -1518,6 +1532,10 @@ document.getElementById("LangElement").lang="PL";
                 COMMAND = "http://10.0.0.3/readDATA";
             }
             xhttp.open("GET", COMMAND, !0);
+            var headers = aqAuthHeaders(COMMAND);
+            Object.keys(headers).forEach(function (name) {
+                xhttp.setRequestHeader(name, headers[name]);
+            });
             xhttp.send();
         }
         function CSVread() {
@@ -1549,7 +1567,7 @@ document.getElementById("LangElement").lang="PL";
             if ((Sys === 'I') && (device.InternetConnection() == true)) {
                 readDataFromCsv()
             } else {
-                $.get(COMMAND, function (csv_in) {
+                aqGet(COMMAND, function (csv_in) {
                     var a = $.csv.toObjects(csv_in);
                     readDataFromCsv(a)
                 })
@@ -1573,7 +1591,7 @@ document.getElementById("LangElement").lang="PL";
                 console.log("readDataFromCsv()");
                 readDataFromCsvNotifi()
             } else {
-                $.get(COMMAND, function (csv_in) {
+                aqGet(COMMAND, function (csv_in) {
                     var a = $.csv.toObjects(csv_in);
                     readDataFromCsvNotifi(a)
                 })
